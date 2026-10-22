@@ -1,16 +1,11 @@
 """
 SignBridge Flask backend.
 
-Serves the frontend and exposes a /predict endpoint that:
-  1. Receives a base64-encoded video frame from the browser
-  2. Runs MediaPipe hand detection
-  3. Normalises landmarks (wrist-relative + scale) — same pipeline
-     that extract_features.py used at training time
-  4. Feeds the 126-feature vector into the SVM classifier
-  5. Returns { prediction, confidence, mode } as JSON
-
-Also keeps a server-side SentenceBuilder so the browser can
-POST /sentence actions (add, space, backspace, clear, get).
+Serves the frontend and exposes endpoints:
+  /predict       — single-frame SVM classification (letters + digits)
+  /word_record   — start/stop/frame for LSTM word-sign recognition
+  /sentence      — sentence builder actions
+  /status        — model status check
 """
 
 import base64
@@ -27,9 +22,10 @@ from flask import Flask, jsonify, render_template, request
 ROOT = Path(__file__).resolve().parents[2]          # project root
 MODEL_PATH = ROOT / "models" / "alphadigit_classifier.joblib"
 
-# Let Python find the sentence_builder package
+# Let Python find project packages
 sys.path.insert(0, str(ROOT))
 from src.sentence_builder.builder import SentenceBuilder
+from src.recognition.word_recognizer import WordRecognizer
 
 # ── Flask app ──────────────────────────────────────────────────
 app = Flask(
@@ -41,13 +37,14 @@ app = Flask(
 model = None
 hands = None
 builder = SentenceBuilder()
+word_rec = WordRecognizer()
 
 
 def load_model():
     global model, hands
     if not MODEL_PATH.exists():
-        print(f"[SignBridge] Model not found: {MODEL_PATH}")
-        print("  Run train_classifier.py first (with digit fix).")
+        print(f"[SignBridge] SVM model not found: {MODEL_PATH}")
+        print("  Run train_classifier.py first.")
         return False
     model = joblib.load(MODEL_PATH)
     hands = mp.solutions.hands.Hands(
@@ -56,8 +53,17 @@ def load_model():
         min_detection_confidence=0.6,
         min_tracking_confidence=0.6,
     )
-    print(f"[SignBridge] Model loaded — classes: {list(model.classes_)}")
+    print(f"[SignBridge] SVM loaded — classes: {list(model.classes_)}")
     return True
+
+
+def load_word_model():
+    """Try to load the LSTM word model (optional — project works without it)."""
+    ok = word_rec.load()
+    if not ok:
+        print("[SignBridge] Word LSTM not found — word mode disabled.")
+        print("  Run train_word_lstm.py to enable it.")
+    return ok
 
 
 # ── feature extraction (matches extract_features.py EXACTLY) ──
@@ -88,6 +94,17 @@ def extract_features(hand_landmarks):
     return np.asarray(features, dtype=np.float32).reshape(1, -1)
 
 
+def decode_frame(data):
+    """Decode a base64 video frame from the browser into an OpenCV image."""
+    header, encoded = data["frame"].split(",", 1)
+    img_bytes = base64.b64decode(encoded)
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("imdecode returned None")
+    return frame
+
+
 # ── routes ─────────────────────────────────────────────────────
 
 @app.route("/")
@@ -97,12 +114,16 @@ def index():
 
 @app.route("/status")
 def status():
-    """Quick check so the frontend knows the model is loaded."""
-    return jsonify({"model_loaded": model is not None})
+    """Frontend checks which models are available."""
+    return jsonify({
+        "model_loaded": model is not None,
+        "word_model_loaded": word_rec.model is not None,
+    })
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
+    """Single-frame SVM prediction for letters/digits."""
     if model is None:
         return jsonify({"error": "Model not loaded"}), 503
 
@@ -110,18 +131,11 @@ def predict():
     if not data or "frame" not in data:
         return jsonify({"error": "No frame data"}), 400
 
-    # ── decode base64 → OpenCV image ──
     try:
-        header, encoded = data["frame"].split(",", 1)
-        img_bytes = base64.b64decode(encoded)
-        arr = np.frombuffer(img_bytes, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            raise ValueError("imdecode returned None")
+        frame = decode_frame(data)
     except Exception as e:
         return jsonify({"error": f"Bad frame: {e}"}), 400
 
-    # ── MediaPipe ──
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result = hands.process(rgb)
 
@@ -132,7 +146,6 @@ def predict():
             "hands_detected": 0,
         })
 
-    # ── normalise + classify ──
     features = extract_features(result.multi_hand_landmarks)
     probabilities = model.predict_proba(features)[0]
     best_idx = int(np.argmax(probabilities))
@@ -146,12 +159,68 @@ def predict():
     })
 
 
+# ── word recognition (LSTM) ──────────────────────────────────
+
+@app.route("/word_record", methods=["POST"])
+def word_record():
+    """
+    Word-sign recording endpoint.  The frontend sends:
+      { "action": "start" }           — begin buffering frames
+      { "action": "frame", "frame": "data:image/jpeg;base64,..." }
+                                       — add one frame to buffer
+      { "action": "stop" }            — stop recording + predict
+    """
+    if word_rec.model is None:
+        return jsonify({"error": "Word model not loaded"}), 503
+
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "")
+
+    if action == "start":
+        word_rec.start_recording()
+        return jsonify({"status": "recording"})
+
+    elif action == "frame":
+        if "frame" not in data:
+            return jsonify({"error": "No frame data"}), 400
+        try:
+            frame = decode_frame(data)
+        except Exception as e:
+            return jsonify({"error": f"Bad frame: {e}"}), 400
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = hands.process(rgb)
+        hand_data = result.multi_hand_landmarks if result.multi_hand_landmarks else None
+        word_rec.add_frame(hand_data)
+
+        return jsonify({
+            "status": "recording",
+            "frames": len(word_rec.buffer),
+        })
+
+    elif action == "stop":
+        result = word_rec.stop_recording()
+        if result is None:
+            return jsonify({
+                "prediction": None,
+                "confidence": 0,
+                "error": "Too few frames — hold longer",
+            })
+        word, confidence = result
+        return jsonify({
+            "prediction": word,
+            "confidence": round(confidence, 4),
+        })
+
+    return jsonify({"error": f"Unknown action: {action}"}), 400
+
+
 # ── sentence builder API ──────────────────────────────────────
 
 @app.route("/sentence", methods=["POST"])
 def sentence_api():
     """
-    Actions: add, space, backspace, clear, get, set
+    Actions: add, space, backspace, clear, get, set, word
     Body:  { "action": "add", "char": "A" }
     """
     data = request.get_json(silent=True) or {}
@@ -173,7 +242,6 @@ def sentence_api():
         builder.clear()
     elif action == "set":
         builder.set_text(data.get("text", ""))
-    # 'get' or anything else → just return current text
 
     return jsonify({"text": builder.get_text()})
 
@@ -182,5 +250,6 @@ def sentence_api():
 
 if __name__ == "__main__":
     load_model()
+    load_word_model()
     print("[SignBridge] Starting Flask on http://127.0.0.1:5000")
     app.run(host="127.0.0.1", port=5000, debug=True)

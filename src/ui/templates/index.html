@@ -97,6 +97,10 @@ padding:10px 13px;color:#39514b;font-size:12px;font-weight:650}
 .btn-primary:hover{background:var(--teal-dark)}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .btn.active{background:var(--teal);border-color:var(--teal);color:white}
+.btn-record{background:#dc2626;border-color:#dc2626;color:white}
+.btn-record:hover{background:#b91c1c}
+.btn-record.recording{animation:pulse-red 1s infinite}
+@keyframes pulse-red{0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,.4)}50%{box-shadow:0 0 0 8px rgba(220,38,38,0)}}
 .status-line{margin-top:15px;border-top:1px solid #edf1ef;padding-top:14px;
 display:flex;gap:10px;align-items:flex-start}
 .status-mark{width:27px;height:27px;flex-shrink:0;border-radius:9px;
@@ -238,12 +242,14 @@ font-size:10px;color:#93a09c;padding-top:25px}
         <div class="mode-row" style="margin-top:15px">
           <button class="mode-btn active" data-mode="letter">A-Z Letters</button>
           <button class="mode-btn" data-mode="digit">0-9 Digits</button>
+          <button class="mode-btn" data-mode="word">Word signs</button>
           <button class="mode-btn" data-mode="spelling">Spelling mode</button>
         </div>
 
         <div class="camera-actions">
           <button class="btn btn-primary" id="start">Start camera&nbsp; &#128247;</button>
           <button class="btn" id="stop" disabled>Stop camera</button>
+          <button class="btn btn-record" id="recordWord" style="display:none" disabled>Hold to record sign</button>
         </div>
         <div class="status-line">
           <div class="status-mark" id="statusMark">&#128308;</div>
@@ -308,7 +314,7 @@ font-size:10px;color:#93a09c;padding-top:25px}
         <div class="module"><div class="module-icon">0-9</div>
           <div><h3>Digit recognition</h3><p>Identify signed digits through the camera.</p><span class="module-state" id="modDigit">Checking...</span></div></div>
         <div class="module"><div class="module-icon">ISL</div>
-          <div><h3>Word gestures</h3><p>Recognise supported isolated ISL word signs.</p><span class="module-state">LSTM pending</span></div></div>
+          <div><h3>Word gestures</h3><p>Recognise supported isolated ISL word signs.</p><span class="module-state" id="modWord">Checking...</span></div></div>
       </div>
     </section>
     <footer class="footer"><span>SIGN BRIDGE &mdash; Accessible communication</span><span id="footerStatus">Connecting to model...</span></footer>
@@ -319,7 +325,8 @@ font-size:10px;color:#93a09c;padding-top:25px}
 <script>
 /* ──────────────────────────────────────────────────
    SignBridge frontend
-   Captures video frames → POST /predict → updates UI
+   Modes: letter, digit, spelling (SVM via /predict)
+          word (LSTM via /word_record)
    ────────────────────────────────────────────────── */
 
 const video       = document.getElementById('video');
@@ -328,6 +335,7 @@ const ctx         = canvas.getContext('2d');
 const placeholder = document.getElementById('placeholder');
 const startBtn    = document.getElementById('start');
 const stopBtn     = document.getElementById('stop');
+const recordBtn   = document.getElementById('recordWord');
 const sentence    = document.getElementById('sentence');
 const feedback    = document.getElementById('feedback');
 const predDisplay = document.getElementById('predictionDisplay');
@@ -337,20 +345,23 @@ const confBar     = document.getElementById('confBar');
 const addPredBtn  = document.getElementById('addPred');
 
 let stream       = null;
-let predLoop     = null;   // setInterval id
+let predLoop     = null;   // setInterval id for SVM modes
+let wordLoop     = null;   // setInterval id for word recording frames
 let currentMode  = 'letter';
 let lastPred     = null;
 let lastConf     = 0;
 let modelReady   = false;
+let wordModelReady = false;
+let isRecording  = false;  // word recording state
 
-// ── confidence threshold: ignore noisy low-conf predictions ──
-const CONF_THRESHOLD = 0.0;
+// ── confidence threshold ──
+const CONF_THRESHOLD = 0;
 
 // ── spelling mode state ──
 let spellBuffer     = '';
 let holdChar        = null;
 let holdCount       = 0;
-const HOLD_NEEDED   = 3;   // need 4 consecutive same-char predictions to lock it in
+const HOLD_NEEDED   = 3;
 
 // ── check model status on page load ──
 (async function checkModel() {
@@ -358,7 +369,8 @@ const HOLD_NEEDED   = 3;   // need 4 consecutive same-char predictions to lock i
     const res = await fetch('/status');
     const data = await res.json();
     modelReady = data.model_loaded;
-  } catch(e) { modelReady = false; }
+    wordModelReady = data.word_model_loaded || false;
+  } catch(e) { modelReady = false; wordModelReady = false; }
 
   const ms = document.getElementById('modelStatus');
   const dot = document.getElementById('connDot');
@@ -366,6 +378,7 @@ const HOLD_NEEDED   = 3;   // need 4 consecutive same-char predictions to lock i
   const foot = document.getElementById('footerStatus');
   const modA = document.getElementById('modAlpha');
   const modD = document.getElementById('modDigit');
+  const modW = document.getElementById('modWord');
 
   if (modelReady) {
     ms.textContent = 'Connected'; ms.classList.add('connected');
@@ -379,6 +392,12 @@ const HOLD_NEEDED   = 3;   // need 4 consecutive same-char predictions to lock i
     foot.textContent = 'Model not loaded — run train_classifier.py first';
     modA.textContent = 'Model missing';
     modD.textContent = 'Model missing';
+  }
+
+  if (wordModelReady) {
+    modW.textContent = 'Active'; modW.classList.add('active');
+  } else {
+    modW.textContent = 'LSTM not trained';
   }
 })();
 
@@ -399,9 +418,23 @@ document.querySelectorAll('.mode-btn').forEach(btn => {
     currentMode = btn.dataset.mode;
     // reset spelling state when switching modes
     spellBuffer = ''; holdChar = null; holdCount = 0;
-    predHint.textContent = currentMode === 'spelling'
-      ? 'Spelling mode: hold a sign steady to lock each letter. Letters accumulate into a word.'
-      : 'Show a sign to see predictions.';
+
+    // show/hide record button and toggle prediction loop
+    if (currentMode === 'word') {
+      recordBtn.style.display = '';
+      recordBtn.disabled = !stream || !wordModelReady;
+      stopPredLoop();  // stop SVM loop in word mode
+      predHint.textContent = wordModelReady
+        ? 'Word mode: click "Record sign" then perform the sign. Click again to stop and get prediction.'
+        : 'Word LSTM model not trained yet — run train_word_lstm.py first.';
+    } else {
+      recordBtn.style.display = 'none';
+      if (isRecording) stopWordRecording();
+      if (stream && modelReady) startPredLoop();  // restart SVM loop
+      predHint.textContent = currentMode === 'spelling'
+        ? 'Spelling mode: hold a sign steady to lock each letter. Letters accumulate into a word.'
+        : 'Show a sign to see predictions.';
+    }
   });
 });
 
@@ -425,8 +458,11 @@ startBtn.addEventListener('click', async () => {
     document.getElementById('cameraMessage').textContent = 'Live preview active. Predictions running.';
     document.getElementById('statusMark').textContent = '&#128994;';
 
-    // start prediction loop (sends a frame every 400ms)
-    if (modelReady) startPredLoop();
+    if (currentMode === 'word') {
+      recordBtn.disabled = !wordModelReady;
+    } else if (modelReady) {
+      startPredLoop();
+    }
   } catch(error) {
     startBtn.disabled = false;
     document.getElementById('cameraStatus').textContent = 'Could not open camera';
@@ -436,9 +472,11 @@ startBtn.addEventListener('click', async () => {
 
 stopBtn.addEventListener('click', () => {
   stopPredLoop();
+  if (isRecording) stopWordRecording();
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null; video.srcObject = null; video.style.display = 'none';
   placeholder.style.display = 'block'; startBtn.disabled = false; stopBtn.disabled = true;
+  recordBtn.disabled = true;
   document.getElementById('camLabel').textContent = 'Camera — Off';
   document.getElementById('cameraStatus').textContent = 'Camera is not running';
   document.getElementById('cameraMessage').textContent = 'Your browser will ask permission before accessing the camera.';
@@ -450,7 +488,7 @@ stopBtn.addEventListener('click', () => {
 });
 
 
-// ── prediction loop ──
+// ── SVM prediction loop (letter/digit/spelling modes) ──
 function startPredLoop() {
   if (predLoop) return;
   predBadge.textContent = 'Live'; predBadge.classList.add('live');
@@ -461,12 +499,17 @@ function stopPredLoop() {
   if (predLoop) { clearInterval(predLoop); predLoop = null; }
 }
 
-async function sendFrame() {
-  if (!video.videoWidth) return;         // video not ready yet
+function captureFrame() {
+  if (!video.videoWidth) return null;
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
   ctx.drawImage(video, 0, 0);
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+  return canvas.toDataURL('image/jpeg', 0.7);
+}
+
+async function sendFrame() {
+  const dataUrl = captureFrame();
+  if (!dataUrl) return;
 
   try {
     const res = await fetch('/predict', {
@@ -476,13 +519,11 @@ async function sendFrame() {
     });
     const data = await res.json();
     handlePrediction(data);
-  } catch(e) {
-    // silently skip network hiccups
-  }
+  } catch(e) { /* silently skip */ }
 }
 
 
-// ── handle prediction result ──
+// ── handle SVM prediction result ──
 function handlePrediction(data) {
   if (!data.prediction || data.confidence < CONF_THRESHOLD) {
     predDisplay.textContent = '—'; predDisplay.classList.remove('has-value');
@@ -491,7 +532,6 @@ function handlePrediction(data) {
       ? 'No hands detected — show your hand to the camera.'
       : 'Low confidence — hold the sign steadier.';
     addPredBtn.disabled = true;
-    // reset spelling hold
     holdChar = null; holdCount = 0;
     return;
   }
@@ -515,7 +555,6 @@ function handlePrediction(data) {
     if (pred === holdChar) {
       holdCount++;
       if (holdCount === HOLD_NEEDED) {
-        // locked in — add to spell buffer and to sentence
         spellBuffer += pred;
         sentence.value += pred;
         updateCount();
@@ -529,17 +568,109 @@ function handlePrediction(data) {
 }
 
 
+// ── word recording (LSTM) ──
+recordBtn.addEventListener('click', () => {
+  if (isRecording) {
+    stopWordRecording();
+  } else {
+    startWordRecording();
+  }
+});
+
+async function startWordRecording() {
+  isRecording = true;
+  recordBtn.textContent = 'Stop recording';
+  recordBtn.classList.add('recording');
+  predBadge.textContent = 'Recording'; predBadge.classList.add('live');
+  predDisplay.textContent = '...'; predDisplay.classList.remove('has-value');
+  predHint.textContent = 'Perform the word sign now...';
+  confBar.style.width = '0';
+
+  // tell server to start recording
+  try {
+    await fetch('/word_record', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'start' }),
+    });
+  } catch(e) { /* continue anyway */ }
+
+  // send frames at ~15fps while recording
+  wordLoop = setInterval(sendWordFrame, 66);
+}
+
+async function sendWordFrame() {
+  const dataUrl = captureFrame();
+  if (!dataUrl) return;
+
+  try {
+    const res = await fetch('/word_record', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'frame', frame: dataUrl }),
+    });
+    const data = await res.json();
+    if (data.frames) {
+      predHint.textContent = `Recording... ${data.frames} frames captured`;
+    }
+  } catch(e) { /* skip */ }
+}
+
+async function stopWordRecording() {
+  isRecording = false;
+  if (wordLoop) { clearInterval(wordLoop); wordLoop = null; }
+  recordBtn.textContent = 'Hold to record sign';
+  recordBtn.classList.remove('recording');
+  predHint.textContent = 'Processing...';
+
+  try {
+    const res = await fetch('/word_record', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'stop' }),
+    });
+    const data = await res.json();
+
+    if (data.prediction) {
+      lastPred = data.prediction;
+      lastConf = data.confidence;
+      predDisplay.textContent = data.prediction;
+      predDisplay.classList.add('has-value');
+      confBar.style.width = (data.confidence * 100) + '%';
+      predHint.textContent = `Word: ${data.prediction} (${(data.confidence * 100).toFixed(1)}% confidence)`;
+      predBadge.textContent = 'Predicted'; predBadge.classList.add('live');
+      addPredBtn.disabled = false;
+    } else {
+      predDisplay.textContent = '—'; predDisplay.classList.remove('has-value');
+      confBar.style.width = '0';
+      predHint.textContent = data.error || 'Could not recognise — try again';
+      predBadge.textContent = 'No result';
+      addPredBtn.disabled = true;
+    }
+  } catch(e) {
+    predHint.textContent = 'Network error — try again';
+  }
+}
+
+
 // ── manual add prediction button ──
 addPredBtn.addEventListener('click', () => {
   if (!lastPred) return;
-  sentence.value += lastPred;
+  // in word mode, add the word with a space
+  if (currentMode === 'word') {
+    if (sentence.value && !sentence.value.endsWith(' ')) {
+      sentence.value += ' ';
+    }
+    sentence.value += lastPred;
+  } else {
+    sentence.value += lastPred;
+  }
   updateCount();
 });
 
 
 // ── text editing buttons ──
 document.getElementById('space').addEventListener('click', () => {
-  // in spelling mode, space commits the current spell buffer as a word
   if (currentMode === 'spelling' && spellBuffer) {
     sentence.value += ' ';
     spellBuffer = ''; holdChar = null; holdCount = 0;
@@ -556,7 +687,6 @@ document.getElementById('back').addEventListener('click', () => {
   if (a !== b) sentence.setRangeText('', a, b, 'end');
   else if (a > 0) sentence.setRangeText('', a - 1, a, 'end');
   sentence.focus(); updateCount();
-  // also trim spelling buffer
   if (currentMode === 'spelling' && spellBuffer.length > 0) {
     spellBuffer = spellBuffer.slice(0, -1);
   }
@@ -592,6 +722,7 @@ document.getElementById('stopSpeak').addEventListener('click', () => {
 // ── cleanup ──
 window.addEventListener('beforeunload', () => {
   stopPredLoop();
+  if (wordLoop) clearInterval(wordLoop);
   if (stream) stream.getTracks().forEach(t => t.stop());
 });
 </script>
