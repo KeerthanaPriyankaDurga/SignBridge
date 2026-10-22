@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+data/processed/
+models/*.pt
+models/*.pth
+models/*.onnx
+evaluation/results/
