@@ -15,7 +15,7 @@ DATA_FILE = ROOT / "data" / "processed" / "alphabet_features.csv"
 MODEL_DIR = ROOT / "models"
 
 # Separate model: does not overwrite the existing combined model.
-MODEL_PATH = MODEL_DIR / "alphabet_only_classifier.joblib"
+MODEL_PATH = MODEL_DIR / "alphadigit_classifier.joblib"
 
 
 def load_alphabet_data():
@@ -28,8 +28,7 @@ def load_alphabet_data():
         for row in reader:
             label = row["label"].strip().upper()
 
-            # Keep English alphabet letters only.
-            if len(label) != 1 or label not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            if len(label) != 1 or label not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
                 continue
 
             values = [float(value) for value in row["features"].split()]
@@ -61,7 +60,9 @@ def main():
     print(f"Alphabet samples: {len(X)}")
     print(f"Alphabet classes: {len(classes)}")
 
-    missing = sorted(set("ABCDEFGHIJKLMNOPQRSTUVWXYZ") - set(classes))
+    expected = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+    missing = sorted(expected - set(classes))
+
     if missing:
         print("Missing classes:", ", ".join(missing))
         print("Training stopped to avoid an incomplete alphabet model.")
@@ -99,7 +100,7 @@ def main():
         classification_report(
             y_test,
             predictions,
-            labels=list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+            labels=list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
             zero_division=0,
         )
     )

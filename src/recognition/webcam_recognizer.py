@@ -7,7 +7,7 @@ import mediapipe as mp
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL_PATH = ROOT / "models" / "alphabet_only_classifier.joblib"
+MODEL_PATH = ROOT / "models" / "alphadigit_classifier.joblib"
 
 
 def normalize_hand(hand):
